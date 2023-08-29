@@ -156,6 +156,9 @@ option(FLB_PROXY_GO            "Enable Go plugins support"    Yes)
 # Built-in Custom Plugins
 option(FLB_CUSTOM_CALYPTIA     "Enable Calyptia Support"      Yes)
 
+# Tenzir input and output plugins
+option(FLB_TENZIR              "Build with Tenzir support"     Yes)
+
 # Config formats
 option(FLB_CONFIG_YAML         "Enable YAML config format"    Yes)
 
@@ -209,6 +212,8 @@ option(FLB_IN_OPENTELEMETRY            "Enable OpenTelemetry input plugin"      
 option(FLB_IN_ELASTICSEARCH            "Enable Elasticsearch (Bulk API) input plugin" Yes)
 option(FLB_IN_CALYPTIA_FLEET           "Enable Calyptia Fleet input plugin"           Yes)
 option(FLB_IN_SPLUNK                   "Enable Splunk HTTP HEC input plugin"          Yes)
+option(FLB_IN_TENZIR                   "Enable Tenzir input plugin"
+     Yes)
 option(FLB_OUT_AZURE                   "Enable Azure output plugin"                   Yes)
 option(FLB_OUT_AZURE_BLOB              "Enable Azure output plugin"                   Yes)
 option(FLB_OUT_AZURE_LOGS_INGESTION    "Enable Azure Logs Ingestion output plugin"    Yes)

@@ -257,6 +257,10 @@ if(FLB_REGEX)
   REGISTER_IN_PLUGIN("in_stdin")
 endif()
 
+if(FLB_TENZIR)
+  REGISTER_IN_PLUGIN("in_tenzir")
+endif()
+
 if(FLB_PARSER)
   REGISTER_IN_PLUGIN("in_syslog")
   REGISTER_IN_PLUGIN("in_exec")
