@@ -22,7 +22,6 @@
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_engine.h>
 #include <fluent-bit/flb_time.h>
-#include <fluent-bit/flb_parser.h>
 #include <fluent-bit/flb_error.h>
 #include <fluent-bit/flb_utils.h>
 
@@ -149,166 +148,85 @@ static inline int process_pack(struct flb_in_tenzir_config *ctx,
     return ret;
 }
 
-static inline int pack_regex(struct flb_in_tenzir_config *ctx,
-                             struct flb_time *t, char *data, size_t data_size)
-{
-    int ret;
-
-    ret = flb_log_event_encoder_begin_record(ctx->log_encoder);
-
-    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
-        ret = flb_log_event_encoder_set_timestamp(ctx->log_encoder, t);
-    }
-
-    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
-        ret = flb_log_event_encoder_set_body_from_raw_msgpack(
-                ctx->log_encoder, data, data_size);
-    }
-
-    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
-        ret = flb_log_event_encoder_commit_record(ctx->log_encoder);
-    }
-
-    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
-        ret = 0;
-    }
-    else {
-        ret = -1;
-    }
-
-    return ret;
-}
-
+/* When Fluent Bit calls us, we perform the following steps:
+ *
+ *     1. Lock the shared buffer.
+ *     2. Parse the JSON and deliver the generated events (like in_stdin)
+ *     3. Unlock the shared shared buffer.
+ */
 static int in_tenzir_collect(struct flb_input_instance *ins,
-                            struct flb_config *config, void *in_context)
+                             struct flb_config *config, void *in_context)
 {
-    int bytes = 0;
     int pack_size;
     int ret;
     char *pack;
-    void *out_buf;
-    size_t out_size;
-    struct flb_time out_time;
     struct flb_in_tenzir_config *ctx = in_context;
 
-    bytes = read(ctx->fd,
-                 ctx->buf + ctx->buf_len,
-                 ctx->buf_size - ctx->buf_len - 1);
-    flb_plg_trace(ctx->ins, "stdin read() = %i", bytes);
+    pthread_mutex_lock(&ctx->shared->lock);
 
-    if (bytes == 0) {
-        flb_plg_warn(ctx->ins, "end of file (stdin closed by remote end)");
-    }
-
-    if (bytes <= 0) {
-        flb_input_collector_pause(ctx->coll_fd, ctx->ins);
+    if (ctx->shared->len <= 0) {
+        flb_plg_trace(ctx->ins, "no new data available, pausing collector");
+        flb_input_collector_pause(ctx->collector, ctx->ins);
         flb_engine_exit(config);
-        return -1;
-    }
-    ctx->buf_len += bytes;
-    ctx->buf[ctx->buf_len] = '\0';
-
-    while (ctx->buf_len > 0) {
-        /* Try built-in JSON parser */
-        if (!ctx->parser) {
-            ret = flb_pack_json_state(ctx->buf, ctx->buf_len,
-                                      &pack, &pack_size, &ctx->pack_state);
-            if (ret == FLB_ERR_JSON_PART) {
-                flb_plg_debug(ctx->ins, "data incomplete, waiting for more...");
-                return 0;
-            }
-            else if (ret == FLB_ERR_JSON_INVAL) {
-                flb_plg_debug(ctx->ins, "invalid JSON message, skipping");
-                flb_pack_state_reset(&ctx->pack_state);
-                flb_pack_state_init(&ctx->pack_state);
-                ctx->pack_state.multiple = FLB_TRUE;
-                ctx->buf_len = 0;
-                return -1;
-            }
-
-            /* Process valid packaged records */
-            process_pack(ctx, pack, pack_size);
-
-            /* Move out processed bytes */
-            consume_bytes(ctx->buf, ctx->pack_state.last_byte, ctx->buf_len);
-            ctx->buf_len -= ctx->pack_state.last_byte;
-            ctx->buf[ctx->buf_len] = '\0';
-
-            flb_pack_state_reset(&ctx->pack_state);
-            flb_pack_state_init(&ctx->pack_state);
-            ctx->pack_state.multiple = FLB_TRUE;
-
-            flb_free(pack);
-
-            if (ctx->log_encoder->output_length > 0) {
-                flb_input_log_append(ctx->ins, NULL, 0,
-                                     ctx->log_encoder->output_buffer,
-                                     ctx->log_encoder->output_length);
-            }
-
-            flb_log_event_encoder_reset(ctx->log_encoder);
-
-            return 0;
-        }
-        else {
-            /* Reset time for each line */
-            flb_time_zero(&out_time);
-
-            /* Use the defined parser */
-            ret = flb_parser_do(ctx->parser, ctx->buf, ctx->buf_len,
-                                &out_buf, &out_size, &out_time);
-
-            if (ret >= 0) {
-                if (flb_time_to_nanosec(&out_time) == 0L) {
-                    flb_time_get(&out_time);
-                }
-                pack_regex(ctx, &out_time, out_buf, out_size);
-                flb_free(out_buf);
-
-                if (ctx->log_encoder->output_length > 0) {
-                    flb_input_log_append(ctx->ins, NULL, 0,
-                                         ctx->log_encoder->output_buffer,
-                                         ctx->log_encoder->output_length);
-                }
-
-                flb_log_event_encoder_reset(ctx->log_encoder);
-            }
-            else {
-                /* we need more data ? */
-                flb_plg_trace(ctx->ins, "data mismatch or incomplete : %d", ret);
-                return 0;
-            }
-        }
-
-        if (ret == ctx->buf_len) {
-            ctx->buf_len = 0;
-            break;
-        }
-        else if (ret >= 0) {
-            /*
-             * 'ret' is the last byte consumed by the regex engine, we need
-             * to advance it position.
-             */
-            ret++;
-            consume_bytes(ctx->buf, ret, ctx->buf_len);
-            ctx->buf_len -= ret;
-            ctx->buf[ctx->buf_len] = '\0';
-        }
+        /* Arguably, this is not an error, but in_stdin.c returns -1 when
+         * pausing the collector, so we do the same. */
+        goto error;
     }
 
+    /* Parse the JSON and deliver the generated events. */
+    flb_plg_trace(ctx->ins, "processing %i bytes: %s", ctx->shared->len,
+                  ctx->shared->buf);
+    ret = flb_pack_json_state(ctx->shared->buf, ctx->shared->len,
+                              &pack, &pack_size, &ctx->pack_state);
+    // We're not checking for FLB_ERR_JSON_PART because our JSON parser
+    // never generates partial JSON.
+    if (ret == FLB_ERR_JSON_INVAL) {
+        flb_plg_debug(ctx->ins, "invalid JSON message, skipping");
+        flb_pack_state_reset(&ctx->pack_state);
+        flb_pack_state_init(&ctx->pack_state);
+        ctx->pack_state.multiple = FLB_TRUE;
+        ctx->shared->len = 0;
+        goto error;
+    }
+
+    /* Process valid packaged records */
+    process_pack(ctx, pack, pack_size);
+
+    /* Move out processed bytes */
+    consume_bytes(ctx->shared->buf, ctx->pack_state.last_byte,
+                  ctx->shared->len);
+    ctx->shared->len -= ctx->pack_state.last_byte;
+    ctx->shared->buf[ctx->shared->len] = '\0';
+
+    flb_pack_state_reset(&ctx->pack_state);
+    flb_pack_state_init(&ctx->pack_state);
+    ctx->pack_state.multiple = FLB_TRUE;
+
+    flb_free(pack);
+
+    if (ctx->log_encoder->output_length > 0) {
+        flb_input_log_append(ctx->ins, NULL, 0,
+                             ctx->log_encoder->output_buffer,
+                             ctx->log_encoder->output_length);
+    }
+
+    flb_log_event_encoder_reset(ctx->log_encoder);
+
+    pthread_mutex_unlock(&ctx->shared->lock);
     return 0;
+
+error:
+    pthread_mutex_unlock(&ctx->shared->lock);
+    return 1;
 }
 
 /* Read tenzir config*/
 static int in_tenzir_config_init(struct flb_in_tenzir_config *ctx,
-                               struct flb_input_instance *in,
-                               struct flb_config *config)
+                                 struct flb_input_instance *in,
+                                 struct flb_config *config)
 {
     int ret;
 
-    ctx->buf_size = DEFAULT_BUF_SIZE;
-    ctx->buf = NULL;
-    ctx->buf_len = 0;
     ctx->ins = in;
 
     ret = flb_input_config_map_set(in, (void *)ctx);
@@ -316,18 +234,6 @@ static int in_tenzir_config_init(struct flb_in_tenzir_config *ctx,
         return -1;
     }
 
-    /* buffer size setting */
-    if (ctx->buf_size == -1) {
-        flb_plg_error(ctx->ins, "buffer_size is invalid");
-        return -1;
-    }
-    else if (ctx->buf_size < DEFAULT_BUF_SIZE) {
-        flb_plg_error(ctx->ins, "buffer_size '%zu' must be at least %i bytes",
-                      ctx->buf_size, DEFAULT_BUF_SIZE);
-        return -1;
-    }
-
-    flb_plg_debug(ctx->ins, "buf_size=%zu", ctx->buf_size);
     return 0;
 }
 
@@ -341,18 +247,13 @@ static void in_tenzir_config_destroy(struct flb_in_tenzir_config *ctx)
         flb_log_event_encoder_destroy(ctx->log_encoder);
     }
 
-    /* release buffer */
-    if (ctx->buf) {
-        flb_free(ctx->buf);
-    }
     flb_free(ctx);
 }
 
 /* Initialize plugin */
 static int in_tenzir_init(struct flb_input_instance *in,
-                         struct flb_config *config, void *data)
+                          struct flb_config *config, void *data)
 {
-    int fd;
     int ret;
     struct flb_in_tenzir_config *ctx;
 
@@ -362,34 +263,27 @@ static int in_tenzir_init(struct flb_input_instance *in,
         return -1;
     }
 
-    ctx->log_encoder = flb_log_event_encoder_create(FLB_LOG_EVENT_FORMAT_DEFAULT);
+    /* Accept shared state. */
+    if (data == NULL) {
+        flb_plg_error(in, "could not find shared Tenzir state");
+        goto init_error;
+    }
+    ctx->shared = (struct shared_state*)data;
 
+    ctx->ins = in;
+
+    ctx->log_encoder =
+        flb_log_event_encoder_create(FLB_LOG_EVENT_FORMAT_DEFAULT);
     if (ctx->log_encoder == NULL) {
         flb_plg_error(in, "could not initialize event encoder");
-
         goto init_error;
     }
 
-    /* Initialize tenzir config */
+    /* Initialize stdin config */
     ret = in_tenzir_config_init(ctx, in, config);
     if (ret < 0) {
         goto init_error;
     }
-
-    ctx->buf = flb_malloc(ctx->buf_size);
-    if (!ctx->buf) {
-        flb_errno();
-        goto init_error;
-    }
-
-    /* Clone the standard input file descriptor */
-    fd = dup(STDIN_FILENO);
-    if (fd == -1) {
-        flb_errno();
-        flb_plg_error(ctx->ins, "Could not open standard input!");
-        goto init_error;
-    }
-    ctx->fd = fd;
 
     /* Always initialize built-in JSON pack state */
     flb_pack_state_init(&ctx->pack_state);
@@ -398,22 +292,21 @@ static int in_tenzir_init(struct flb_input_instance *in,
     /* Set the context */
     flb_input_set_context(in, ctx);
 
-    /* Collect upon data available on the standard input */
-    ret = flb_input_set_collector_event(in,
-                                        in_tenzir_collect,
-                                        ctx->fd,
-                                        config);
+    /* Trigger collection callback in a time-based manner */
+    time_t seconds = 0;
+    long nanoseconds = 1 * 1000 * 1000;
+    ret = flb_input_set_collector_time(in, in_tenzir_collect, seconds,
+                                       nanoseconds, config);
     if (ret == -1) {
         flb_plg_error(ctx->ins, "Could not set collector for Tenzir input plugin");
         goto init_error;
     }
-    ctx->coll_fd = ret;
+    ctx->collector = ret;
 
     return 0;
 
 init_error:
     in_tenzir_config_destroy(ctx);
-
     return -1;
 }
 
@@ -426,9 +319,6 @@ static int in_tenzir_exit(void *in_context, struct flb_config *config)
         return 0;
     }
 
-    if (ctx->fd >= 0) {
-        close(ctx->fd);
-    }
     flb_pack_state_reset(&ctx->pack_state);
     in_tenzir_config_destroy(ctx);
 
@@ -436,11 +326,6 @@ static int in_tenzir_exit(void *in_context, struct flb_config *config)
 }
 
 static struct flb_config_map config_map[] = {
-    {
-      FLB_CONFIG_MAP_SIZE, "buffer_size", (char *)NULL,
-      0, FLB_TRUE, offsetof(struct flb_in_tenzir_config, buf_size),
-      "Set the read buffer size"
-    },
     /* EOF */
     {0}
 };

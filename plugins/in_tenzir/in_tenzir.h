@@ -25,17 +25,24 @@
 #include <fluent-bit/flb_log_event_decoder.h>
 #include <fluent-bit/flb_log_event_encoder.h>
 
-#define DEFAULT_BUF_SIZE 16000
+#include <pthread.h>
 
-/* STDIN Input configuration & context */
+/* Shared state between Tenzir and Fluent Bit.
+ * WARNING: keep in sync with the respective code bases.
+ */
+struct shared_state {
+    char            *buf;
+    int             len;
+    pthread_mutex_t lock;
+};
+
+/* Tenzir Input configuration & context */
 struct flb_in_tenzir_config {
-    int    fd;                /* stdin file descriptor */
-    int    coll_fd;           /* collector fd          */
-    size_t buf_size;          /* size of a buffer      */
-    int    buf_len;           /* read buffer length    */
-    char   *buf;              /* read buffer           */
+    /* Shared state with Tenzir */
+    struct shared_state *shared;
 
-    /* Parser / Format */
+    /* Fluent Bit state */
+    int collector;
     struct flb_pack_state pack_state;
     struct flb_input_instance *ins;
     struct flb_log_event_encoder *log_encoder;
